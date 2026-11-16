@@ -2,11 +2,17 @@ import time, json
 from sqlalchemy import select, func
 from src.config.database import Session
 from migrations.initial import migrate
-from src.models import User, Dataset, Job, Report, Delivery, Audit
+from src.models import (
+    User, Dataset, Job, Report, Delivery, Audit, AudienceScheme, AudienceBuild,
+)
 from src.services.business import metadata, seed_records, analyze
 from src.services.reports import deliver
+from src.services import audience
+from src.services.audience_engine import run_build
 from src.utils.security import hash_password
 from src.utils.serialization import checksum
+
+
 def seed():
     migrate()
     with Session() as db:
@@ -31,8 +37,39 @@ def seed():
             r=Report(name='每日业务复核简报',job_id=j.id,destination='业务复核组 · 本地收件箱',interval_seconds=86400,next_run=time.time()+86400,enabled=True)
             db.add(r);db.flush();deliver(db,r)
             db.add(Audit(actor='seed',action='demo.baseline',detail={'dataset':d.id},at=time.time()))
+
+        # 演示人群方案：第二批与第一批重叠 40 名读者并改动特征，制造可裁定冲突
+        if not db.scalar(select(AudienceScheme).where(AudienceScheme.name=='编辑回访候选人群')):
+            admin=db.scalar(select(User).where(User.role=='admin'))
+            overlap=[dict(r) for r in d.records[:40]]
+            for row in overlap:
+                row['sessions_14d']=int(row['sessions_14d'])+3
+                row['completion_pct']=round(min(99.0,float(row['completion_pct'])+8),1)
+            extra=seed_records()[120:160]
+            second=overlap+extra
+            d2=Dataset(name='近期复测快照（含同读者新观测）',source=m['short']+'-202611-retest.csv',
+                       records=second,checksum=checksum(second),created_at=time.time())
+            db.add(d2); db.flush()
+            from src.schemas.audience import SchemeCreate, RefStep
+            scheme,_=audience.create_scheme(db,SchemeCreate(
+                name='编辑回访候选人群',description='基线快照并集近期复测，重叠读者特征冲突待裁定后发布。',
+                definition=[
+                    RefStep(key='base',kind='dataset',ref_id=d.id,op='union'),
+                    RefStep(key='retest',kind='dataset',ref_id=d2.id,op='union'),
+                ]),admin)
+            scheme,version=audience.publish_scheme(db,scheme.id,scheme.revision,admin)
+            build,_=audience.start_build(db,scheme.id,admin)
+            run_build(db,build)
+            # 自动裁定全部冲突（采用近期复测来源），演示完整闭环
+            from src.models import FeatureConflict
+            for c in db.scalars(select(FeatureConflict).where(FeatureConflict.build_id==build.id)):
+                audience.arbitrate(db,build.id,c.id,c.candidates[-1]['source'],admin)
+            audience.release_build(db,build.id,admin)
+            db.add(Audit(actor='seed',action='demo.audience',detail={'scheme':scheme.id,'build':build.id},at=time.time()))
+
         db.commit()
-        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in [User,Dataset,Job,Report,Delivery,Audit]}
+        models=[User,Dataset,Job,Report,Delivery,Audit,AudienceScheme,AudienceBuild]
+        counts={model.__tablename__:db.scalar(select(func.count()).select_from(model)) for model in models}
         print(json.dumps(counts,ensure_ascii=False))
         return counts
 if __name__=='__main__':seed()

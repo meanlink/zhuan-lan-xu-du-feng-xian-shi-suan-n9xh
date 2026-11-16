@@ -1,17 +1,22 @@
 import time, os, csv, io, hashlib, json
 from fastapi import HTTPException
 from src.models import Job, Report, Delivery
+from src.constants.enums import EligibilityStatus
 from src.config.settings import ARTIFACT_DIR
 def create(db, data):
     j=db.get(Job,data.job_id)
     if not j or j.status!='completed' or not j.approved:
         raise HTTPException(409,'请先选择已完成且获批准的分析结果')
+    if j.eligibility==EligibilityStatus.invalidated.value:
+        raise HTTPException(409,'该试验依赖的人群已失效，分发资格已停用；历史归档保留但不能新建分发计划')
     r=Report(name=data.name, job_id=j.id, destination=data.destination, interval_seconds=data.interval_seconds, next_run=time.time()+data.delay_seconds, enabled=True)
     db.add(r); db.flush()
     return r
 def deliver(db, report):
     j=db.get(Job,report.job_id)
     if not j or not j.approved: return
+    # 资格失效后 worker 不再产生新投递；已生成资料保留
+    if j.eligibility==EligibilityStatus.invalidated.value or not report.enabled: return
     out=io.StringIO()
     out.write('\ufeff')
     table=j.result.get('table',{})
